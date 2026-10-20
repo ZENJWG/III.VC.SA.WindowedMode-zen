@@ -1,9 +1,9 @@
 module;
 #include "stdafx.h"
 #include "Bindings.h"
+#include "ResolutionPolicy.h"
 #include <dwmapi.h>
 #pragma comment(lib, "dwmapi.lib")
-#pragma comment(lib, "winmm.lib")
 
 module WindowedMode;
 
@@ -34,6 +34,8 @@ HWND __stdcall WindowedMode::InitWindow(DWORD, LPCSTR className, LPCSTR title, D
         return nullptr;
     }
     inst->InitConfig();
+    // Must be set before monitor geometry is queried or the HWND is created.
+    inst->EnableDpiAwareness();
     const bool maximize = inst->LoadConfig();
     const bool center = inst->windowPos.x == -1 || inst->windowPos.y == -1;
     inst->WindowCalculateGeometry(center);
@@ -91,6 +93,7 @@ void WindowedMode::WindowCalculateGeometry(bool center, bool resizeWindow)
 {
     if (windowUpdating) return;
     windowUpdating = true;
+    cursorClientRectValid = false;
 
     POINT windowCenter = { windowPos.x + windowSize.x / 2, windowPos.y + windowSize.y / 2};
     auto monitorRect = GetMonitorRect(windowCenter);
@@ -116,7 +119,10 @@ void WindowedMode::WindowCalculateGeometry(bool center, bool resizeWindow)
             windowSize.y = min(windowSize.y, monitorHeight);
         }
 
-        windowSizeClient = windowSizeWindowed = ClientFromSize(windowSize);
+        // The actual bordered client may be smaller than a 4K request because
+        // its frame must fit on the monitor. Do not overwrite the requested
+        // resolution merely by switching window styles.
+        windowSizeClient = ClientFromSize(windowSize);
 
         // window position
         if (center)
@@ -167,8 +173,8 @@ void WindowedMode::WindowCalculateGeometry(bool center, bool resizeWindow)
         client.right > 0 && client.bottom > 0)
     {
         windowSizeClient = { client.right, client.bottom };
-        if (!IsZoomed(window) && windowMode != WindowMode::Fullscreen)
-            windowSizeWindowed = windowSizeClient;
+        // windowSizeWindowed is the requested (persisted) size. Real user
+        // resizing is recorded in WM_WINDOWPOSCHANGED instead.
     }
 
     // apply resolution to game internals
@@ -193,6 +199,56 @@ void WindowedMode::WindowCalculateGeometry(bool center, bool resizeWindow)
             MAKELPARAM(windowSizeClient.x, windowSizeClient.y));
 }
 
+void WindowedMode::WindowApplyExternalRect(const RECT& bounds)
+{
+    if (!window || windowUpdating || resetInProgress || IsIconic(window) ||
+        bounds.right <= bounds.left || bounds.bottom <= bounds.top)
+        return;
+
+    RECT previousBounds{};
+    const bool havePrevious = GetWindowRect(window, &previousBounds) != FALSE;
+    const POINT previousClient = windowSizeClient;
+
+    // Moving the HWND may synchronously generate WM_SIZE and WM_WINDOWPOSCHANGED.
+    // Block those nested game callbacks and notify RenderWare only once below.
+    windowUpdating = true;
+    bool moved = true;
+    if (!havePrevious || !EqualRect(&previousBounds, &bounds))
+        moved = SetWindowPos(window, nullptr, bounds.left, bounds.top,
+            bounds.right - bounds.left, bounds.bottom - bounds.top,
+            SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE) != FALSE;
+    windowUpdating = false;
+    if (!moved) return;
+
+    windowPos = {bounds.left, bounds.top};
+    windowSize = {bounds.right - bounds.left, bounds.bottom - bounds.top};
+    if (windowMode != Fullscreen)
+        windowPosWindowed = windowPos;
+    else if (autoDesktopResolution)
+        // Track the current monitor for the next switch back to windowed
+        // mode, while keeping ResolutionX/Y = 0/0 on disk.
+        windowSizeWindowed = windowSize;
+
+    // Refresh the actual physical-pixel client size. The requested INI width
+    // and height are intentionally not changed by a DPI or display event.
+    WindowCalculateGeometry(false, false);
+    RECT actualBounds{};
+    if (GetWindowRect(window, &actualBounds))
+        windowSize = {actualBounds.right - actualBounds.left,
+                      actualBounds.bottom - actualBounds.top};
+    WindowUpdateTitle();
+    cursorClientRectValid = false;
+
+    if (d3dDevice && ResolutionPolicy::ShouldNotifyRenderer(
+            {previousClient.x, previousClient.y},
+            {windowSizeClient.x, windowSizeClient.y}))
+        CallWindowProcA(oriWindowProc, window, WM_SIZE, SIZE_RESTORED,
+            MAKELPARAM(windowSizeClient.x, windowSizeClient.y));
+    // Persist the new monitor position, not the DPI-generated window size.
+    if (windowMode != Fullscreen) SaveConfig();
+    MouseUpdate(true);
+}
+
 void WindowedMode::WindowResize(POINT resolution)
 {
     if (resolution.x < Resolution_Min.x || resolution.y < Resolution_Min.y) return;
@@ -207,6 +263,7 @@ void WindowedMode::WindowResize(POINT resolution)
         windowMode = windowedStyle;
 
     windowSizeWindowed = resolution;
+    autoDesktopResolution = false; // an explicit game menu resolution takes precedence
     WindowCalculateGeometry(true, true); // and resize the window
     SaveConfig();
 }
@@ -214,8 +271,6 @@ void WindowedMode::WindowResize(POINT resolution)
 void WindowedMode::WindowToggleFullscreen()
 {
     if (IsIconic(window) || !HasFocus(window)) return;
-    const auto monitor = GetMonitorRect({windowPos.x + windowSize.x / 2, windowPos.y + windowSize.y / 2});
-    const POINT desktop = {monitor.right - monitor.left, monitor.bottom - monitor.top};
     const bool leaving = windowMode == Fullscreen;
     if (!leaving) windowedStyle = windowMode;
     if (IsZoomed(window))
@@ -224,12 +279,10 @@ void WindowedMode::WindowToggleFullscreen()
         ShowWindow(window, SW_RESTORE);
         windowUpdating = false;
     }
-    // A desktop-sized borderless window would otherwise look unchanged when
-    // leaving fullscreen. Keep an unmistakably windowed restore size instead.
-    const bool fallback = windowSizeWindowed.x == desktop.x && windowSizeWindowed.y == desktop.y;
-    if (fallback) windowSizeWindowed = {640, 480};
+    // Preserve the configured resolution. A 4K borderless window may look
+    // identical to desktop fullscreen after Alt+Enter; that is intentional.
     windowMode = leaving ? windowedStyle : Fullscreen;
-    WindowCalculateGeometry(leaving && fallback, true);
+    WindowCalculateGeometry(false, true);
     SaveConfig();
 }
 
@@ -250,32 +303,34 @@ void WindowedMode::WindowToggleStyle()
 
 void WindowedMode::WindowUpdateTitle()
 {
+    // Update the Win32 caption only when its text actually changes. This
+    // avoids WM_SETTEXT traffic at every FPS sampling interval.
+    char nextTitle[sizeof(windowTitle)]{};
+    const char* appName = rsGlobal->AppName ? rsGlobal->AppName : "Grand Theft Auto";
     if (windowMode == WindowMode::Windowed && HasFocus(window))
     {
-        std::string aspectTxt;
-        auto idx = FindAspectRatio(windowSizeClient);
-        if (idx != -1)
-        {
-            aspectTxt = StringPrintf(" (%s)", AspectRatios[idx].name);
-        }
-
-        sprintf_s(windowTitle, "%s | %ux%u%s @ %u fps",
-            rsGlobal->AppName,
-            windowSizeClient.x,
-            windowSizeClient.y,
-            aspectTxt.c_str(),
-            fpsCounter.get());
+        const int idx = FindAspectRatio(windowSizeClient);
+        if (idx >= 0)
+            _snprintf_s(nextTitle, _countof(nextTitle), _TRUNCATE, "%s | %ldx%ld (%s) @ %u fps", appName,
+                windowSizeClient.x, windowSizeClient.y, AspectRatios[idx].name, fpsCounter.get());
+        else
+            _snprintf_s(nextTitle, _countof(nextTitle), _TRUNCATE, "%s | %ldx%ld @ %u fps", appName,
+                windowSizeClient.x, windowSizeClient.y, fpsCounter.get());
     }
     else
-        strcpy_s(windowTitle, rsGlobal->AppName);
-    
-    if (window)
-        SetWindowTextA(window, windowTitle);
+        _snprintf_s(nextTitle, _countof(nextTitle), _TRUNCATE, "%s", appName);
+
+    if (strcmp(windowTitle, nextTitle) != 0)
+    {
+        strcpy_s(windowTitle, nextTitle);
+        if (window) SetWindowTextA(window, windowTitle);
+    }
 }
 
 LRESULT APIENTRY WindowedMode::WindowProc(HWND wnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     if (msg == WM_NCCREATE) inst->window = wnd;
+    if (msg == WM_WINDOWPOSCHANGED) inst->cursorClientRectValid = false;
     // Handle caption buffers in the same ANSI encoding as CreateWindowExA
     // and SetWindowTextA.
     if (msg == WM_SETTEXT || msg == WM_GETTEXT || msg == WM_GETTEXTLENGTH)
@@ -289,6 +344,49 @@ LRESULT APIENTRY WindowedMode::WindowProc(HWND wnd, UINT msg, WPARAM wParam, LPA
         return DefWindowProcA(wnd, msg, wParam, lParam);
     switch (msg)
     {
+        // Per-monitor DPI transitions can change the non-client frame metrics.
+        // Use the OS-suggested rectangle for ordinary windows, and the monitor's
+        // physical bounds for desktop fullscreen; never persist a DPI-generated
+        // client size as the user's requested INI resolution.
+        case WM_DPICHANGED:
+        {
+            if (inst->windowUpdating || inst->resetInProgress || !lParam)
+                return 0;
+            RECT target = *reinterpret_cast<const RECT*>(lParam);
+            if (inst->windowMode == Fullscreen)
+            {
+                const POINT center = {
+                    target.left + (target.right - target.left) / 2,
+                    target.top + (target.bottom - target.top) / 2
+                };
+                target = GetMonitorRect(center);
+            }
+            inst->WindowApplyExternalRect(target);
+            return 0;
+        }
+
+        case WM_DISPLAYCHANGE:
+        {
+            // A fullscreen window follows desktop resolution changes. Ignore
+            // duplicates to avoid unnecessary GPU resets on display events.
+            if (!inst->windowUpdating && !inst->resetInProgress &&
+                inst->windowMode == Fullscreen && !IsIconic(wnd))
+            {
+                RECT current{};
+                if (GetWindowRect(wnd, &current))
+                {
+                    const POINT center = {
+                        current.left + (current.right - current.left) / 2,
+                        current.top + (current.bottom - current.top) / 2
+                    };
+                    const RECT target = GetMonitorRect(center);
+                    if (!EqualRect(&current, &target))
+                        inst->WindowApplyExternalRect(target);
+                }
+            }
+            break; // preserve the game's own WM_DISPLAYCHANGE handler
+        }
+
         // window focus/defocus
         case WM_ACTIVATE:
         {
@@ -318,8 +416,8 @@ LRESULT APIENTRY WindowedMode::WindowProc(HWND wnd, UINT msg, WPARAM wParam, LPA
                         [[fallthrough]];
 
                     case WA_ACTIVE:
-                        if (inst->autoResume && 
-                            (!inst->autoPause || inst->autoPauseExecuted) && 
+                        // Never close a menu the player opened manually.
+                        if (inst->autoResume && inst->autoPauseExecuted &&
                             inst->IsMainMenuVisible()) // TODO: check if not in some submenu
                         {
                             inst->autoPauseExecuted = false;
@@ -394,12 +492,25 @@ LRESULT APIENTRY WindowedMode::WindowProc(HWND wnd, UINT msg, WPARAM wParam, LPA
         case WM_MOUSEMOVE:
         case WM_MOUSEWHEEL:
         {
-            auto hasFocus = HasFocus(wnd);
-            auto inClient = IsCursorInClientRect(wnd);
+            const bool hasFocus = HasFocus(wnd);
+            // Ordinary client mouse messages already contain client coordinates.
+            // Avoid GetCursorPos + GetClientRect + two ClientToScreen calls for
+            // each mouse-move packet, especially on high-polling-rate mice.
+            bool inClient;
+            if (msg == WM_MOUSEWHEEL || msg == WM_MOUSEACTIVATE)
+                inClient = IsCursorInClientRect(wnd);
+            else
+            {
+                const int x = static_cast<short>(LOWORD(lParam));
+                const int y = static_cast<short>(HIWORD(lParam));
+                inClient = x >= 0 && y >= 0 &&
+                    x < inst->windowSizeClient.x && y < inst->windowSizeClient.y;
+            }
 
             if (!hasFocus && inClient)
             {
-                SetCursor(LoadCursor(NULL,IDC_ARROW));
+                static const HCURSOR arrow = LoadCursor(nullptr, IDC_ARROW);
+                SetCursor(arrow);
             }
 
             if (!hasFocus || !inClient)
@@ -428,6 +539,7 @@ LRESULT APIENTRY WindowedMode::WindowProc(HWND wnd, UINT msg, WPARAM wParam, LPA
         // user dragging the window edge
         case WM_ENTERSIZEMOVE:
             inst->sizing = true;
+            inst->sizeBeforeUserResize = inst->windowSizeClient;
             ClipCursor(NULL);
             return 0;
 
@@ -495,6 +607,9 @@ LRESULT APIENTRY WindowedMode::WindowProc(HWND wnd, UINT msg, WPARAM wParam, LPA
 
         case WM_EXITSIZEMOVE:
             inst->sizing = false;
+            if (inst->windowSizeClient.x != inst->sizeBeforeUserResize.x ||
+                inst->windowSizeClient.y != inst->sizeBeforeUserResize.y)
+                inst->autoDesktopResolution = false;
             inst->WindowCalculateGeometry(false, true);
             inst->SaveConfig();
             inst->MouseUpdate(true);
@@ -514,6 +629,7 @@ LRESULT APIENTRY WindowedMode::WindowProc(HWND wnd, UINT msg, WPARAM wParam, LPA
                 return DefWindowProcA(wnd, msg, wParam, lParam);
 
             bool updated = false;
+            bool sizeChanged = false;
             auto info = (WINDOWPOS*)lParam;
 
             // correct modern Windows styles invisible border
@@ -533,6 +649,7 @@ LRESULT APIENTRY WindowedMode::WindowProc(HWND wnd, UINT msg, WPARAM wParam, LPA
                 if (info->cx != inst->windowSize.x || info->cy != inst->windowSize.y)
                 {
                     inst->windowSize = { info->cx, info->cy };
+                    sizeChanged = true;
                     updated = true;
                 }
             }
@@ -546,7 +663,8 @@ LRESULT APIENTRY WindowedMode::WindowProc(HWND wnd, UINT msg, WPARAM wParam, LPA
                 if (inst->windowMode != WindowMode::Fullscreen && !IsZoomed(wnd))
                 {
                     inst->windowPosWindowed = inst->windowPos;
-                    inst->windowSizeWindowed = inst->windowSizeClient;
+                    if (sizeChanged)
+                        inst->windowSizeWindowed = inst->windowSizeClient;
                 }
                 inst->WindowCalculateGeometry();
                 inst->WindowUpdateTitle();
@@ -613,26 +731,56 @@ RECT WindowedMode::GetFrameSize(bool padOnly) const
 
 void WindowedMode::MouseUpdate(bool force)
 {
-    auto hasFocus = HasFocus(window);
+    if (!window) return;
 
-    POINT pos;
-    GetCursorPos(&pos);
+    const bool focused = HasFocus(window);
+    const DWORD now = GetTickCount();
+    // Reassert state occasionally because other mods / the game can change
+    // ShowCursor or ClipCursor without informing us.
+    constexpr DWORD cursorResyncIntervalMs = 250;
+    const bool resync = force || !cursorSyncValid ||
+        (now - lastCursorSyncTime >= cursorResyncIntervalMs);
+    if (resync) lastCursorSyncTime = now;
 
-    RECT rect;
-    GetClientRect(window, &rect);
-    ClientToScreen(window, (LPPOINT)&rect.left);
-    ClientToScreen(window, (LPPOINT)&rect.right);
-
-    // cursor visibility
-    bool inGame = hasFocus && PtInRect(&rect, pos);
-    SetCursorVisible(!inGame);
-
-    // keep cursor inside the window
-    if (hasFocus || force)
+    if (!focused)
     {
-        if (!hasFocus || IsMainMenuVisible())
-            ClipCursor(NULL);
-        else
-            ClipCursor(&rect);
+        if (resync || !cursorShown) SetCursorVisible(true);
+        if (resync || cursorClipped) ClipCursor(nullptr);
+        cursorShown = true;
+        cursorClipped = false;
+        cursorSyncValid = true;
+        return; // No rectangle/mouse polling while the window is inactive.
     }
+
+    if (!cursorClientRectValid || force)
+    {
+        RECT rect{};
+        if (!GetClientRect(window, &rect)) return;
+        // Convert both corners in one Win32 call without aliasing RECT as POINT.
+        POINT corners[2] = {{rect.left, rect.top}, {rect.right, rect.bottom}};
+        MapWindowPoints(window, nullptr, corners, 2);
+        cursorClientRect = {corners[0].x, corners[0].y,
+            corners[1].x, corners[1].y};
+        cursorClientRectValid = true;
+    }
+
+    POINT cursor{};
+    if (!GetCursorPos(&cursor)) return;
+    const bool inside = !sizing && PtInRect(&cursorClientRect, cursor);
+    const bool showCursor = !inside;
+    const bool shouldClip = !sizing && !IsMainMenuVisible();
+
+    if (resync || !cursorSyncValid || showCursor != cursorShown)
+        SetCursorVisible(showCursor);
+
+    if (resync || !cursorSyncValid || shouldClip != cursorClipped ||
+        (shouldClip && !EqualRect(&cursorClipRect, &cursorClientRect)))
+    {
+        ClipCursor(shouldClip ? &cursorClientRect : nullptr);
+    }
+
+    cursorShown = showCursor;
+    cursorClipped = shouldClip;
+    if (shouldClip) cursorClipRect = cursorClientRect;
+    cursorSyncValid = true;
 }

@@ -68,6 +68,7 @@ project "III.VC.SA.WindowedMode"
    targetdir "data/%{cfg.buildcfg}"
    targetextension ".asi"
    
+   defines { "DIRECTINPUT_VERSION=0x0800" }
    defines { "rsc_CompanyName=\"ThirteenAG\"" }
    defines { "rsc_LegalCopyright=\"MIT License\""} 
    local major = os.date("%d")
@@ -88,10 +89,14 @@ project "III.VC.SA.WindowedMode"
    end
 
    local githash = ""
-   local f = io.popen("git rev-parse --short HEAD")
-   if f then
-      githash = f:read("*a"):gsub("%s+", "")
-      f:close()
+   -- Source ZIPs have no Git metadata; do not emit a fatal-looking warning.
+   local gitMetadata = path.join(_SCRIPT_DIR, ".git")
+   if os.isdir(gitMetadata) or os.isfile(gitMetadata) then
+      local f = io.popen("git rev-parse --short HEAD 2>nul")
+      if f then
+         githash = f:read("*a"):gsub("%s+", "")
+         f:close()
+      end
    end
 
    local productVersion = major .. "." .. minor .. "." .. build .. "." .. revision

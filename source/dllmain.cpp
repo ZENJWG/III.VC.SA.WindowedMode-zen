@@ -43,12 +43,11 @@ extern "C" __declspec(dllexport) void InitializeASI()
     });
 }
 
-BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
+// Ultimate ASI Loader invokes InitializeASI after LoadLibrary, outside the
+// Windows loader lock. Keep DllMain empty: pattern scanning, SafetyHook,
+// synchronization and dialogs are unsafe inside DLL_PROCESS_ATTACH.
+// Do not DisableThreadLibraryCalls with premake's static C runtime.
+BOOL APIENTRY DllMain(HMODULE, DWORD, LPVOID)
 {
-    if (reason == DLL_PROCESS_ATTACH)
-    {
-        DisableThreadLibraryCalls(module);
-        InitializeASI();
-    }
     return TRUE;
 }

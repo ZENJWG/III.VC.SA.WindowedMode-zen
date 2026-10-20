@@ -16,8 +16,33 @@ void WindowedMode::BackupVideoModes()
     }
 }
 
+void WindowedMode::SyncActiveVideoMode()
+{
+    BackupVideoModes();
+    if (!*rwVideoModes) return;
+    const auto current = RwEngineGetCurrentVideoMode();
+    if (current >= videoModesBackup.size()) return;
+
+    if (modifiedVideoMode >= 0 && modifiedVideoMode != static_cast<int>(current) &&
+        modifiedVideoMode < static_cast<int>(videoModesBackup.size()))
+        (*rwVideoModes)[modifiedVideoMode] = videoModesBackup[modifiedVideoMode];
+
+    modifiedVideoMode = static_cast<int>(current);
+    auto& mode = (*rwVideoModes)[current];
+    mode.width = static_cast<UINT>(windowSizeClient.x);
+    mode.height = static_cast<UINT>(windowSizeClient.y);
+    mode.flags &= ~1u;
+    mode.refreshRate = 0;
+    const auto format = IsD3D9() ? d3dPresentParams9->BackBufferFormat :
+        d3dPresentParams8->BackBufferFormat;
+    if (format != D3DFMT_UNKNOWN) mode.format = format;
+}
+
 void WindowedMode::ChangeResolution(DWORD modeIndex)
 {
+    // Settings-loading hooks can run before the first device is created.
+    // Those are not user window-resize requests; keep the INI geometry.
+    if (!d3dDevice) return;
     BackupVideoModes();
     if (!*rwVideoModes || modeIndex >= videoModesBackup.size()) return;
     const auto& mode = videoModesBackup[modeIndex];
@@ -46,12 +71,7 @@ int __cdecl WindowedMode::ChangeVideoModeSA(DWORD modeIndex)
     const auto result = inst->bindings.changeVideoMode(modeIndex);
     mode = saved;
     if (inst->RwEngineGetCurrentVideoMode() == modeIndex)
-    {
-        if (inst->modifiedVideoMode >= 0 && inst->modifiedVideoMode != (int)modeIndex)
-            (*inst->rwVideoModes)[inst->modifiedVideoMode] = inst->videoModesBackup[inst->modifiedVideoMode];
-        inst->modifiedVideoMode = (int)modeIndex;
-        mode.flags &= ~1u;
-    }
+        inst->SyncActiveVideoMode();
     return result;
 }
 

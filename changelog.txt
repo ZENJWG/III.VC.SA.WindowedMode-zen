@@ -1,0 +1,168 @@
+III.VC.SA.WindowedMode - CHANGELOG by Zeneric
+=================================
+
+Visual Studio 2026 build compatibility (2026-10-20)
+-----------------------------------------------------------------
+- Fixed Renderer.cpp lines 123-124 failing to compile with Windows min macro
+  enabled (C2589/C2760). Reset sizing now calls (std::min) with type-matched
+  arguments; the working native-4K reset logic is unchanged.
+- Suppressed standalone-ZIP Premake Git metadata errors when .git is absent.
+- Auto-created external/ when absent in a freshly extracted ZIP.
+- Explicitly selected DirectInput 8 headers to remove the default-version notice.
+- Added a portable macro-collision regression test.
+- Verified portable tests only; full Windows/VS2026 build remains to be tested.
+
+Stability, display transitions and frame pacing tools (2026-10-20)
+----------------------------------------------------------------------------
+- Moved ASI startup out of DllMain; kept the Ultimate ASI Loader
+  InitializeASI entry point and removed static CRT-incompatible thread-call
+  suppression. LoadLibrary-only ASI loaders are no longer supported.
+- Added WM_DPICHANGED and WM_DISPLAYCHANGE geometry handling; avoided
+  duplicate renderer resize notifications and preserved requested 4K values.
+- Kept physical client size authoritative during Direct3D resets with safe
+  minimized-window fallback.
+- Validated malformed INI resolutions and made state saves atomic using a
+  temporary file and MoveFileExW replacement.
+- Added an optional offline frame-time CSV analyzer and regression tests.
+- Preserved native 4K, HighDPIAware=1, ResolutionDiagnostics=0 and the
+  game's existing limiter/VSync configuration.
+- Windows x86 build and in-game stability/FPS remain unverified.
+
+Default configuration cleanup (2026-10-20)
+--------------------------------------------------------
+- Disabled resolution diagnostic logging by default (INI, runtime fallback,
+  and class initialization); enable temporarily with ResolutionDiagnostics = 1.
+- Reduced bundled INI comments to two concise usage hints; retained all
+  settings, native 4K behavior, and HighDPIAware = 1.
+
+High-DPI physical-pixel rendering diagnostics (2026-10-20)
+---------------------------------------------------------------------
+- Added HighDPIAware = 1 to request per-monitor-v2 DPI awareness before
+  creating the game window, preventing Windows' DPI virtualization from
+  potentially halving 4K window dimensions at 200% display scaling.
+- Respects process DPI awareness already chosen by Windows manifests,
+  the game or another plugin. Falls back to supported awareness modes on
+  older Windows versions. Can be disabled with HighDPIAware = 0.
+- Added a configurable startup/reset resolution diagnostics file beside the
+  INI. Records physical display mode, client size, Direct3D buffer,
+  active RenderWare mode, and camera raster to pinpoint which layer is
+  actually rendering below native resolution.
+- This is a targeted hypothesis based on the symptom, not a confirmed
+  in-game repair. Windows builds and game testing are still required.
+
+Native resolution / 4K regression fixes (2026-10-20)
+---------------------------------------------------------------------
+- Removed the 640x480 Alt+Enter fallback that replaced and persisted
+  desktop-sized custom resolutions.
+- Preserved requested INI dimensions separately from the constrained size
+  of a bordered window. Moving the window no longer rewrites resolution.
+- Forced valid client dimensions into Direct3D 8/9 reset backbuffers,
+  including when the game supplies stale nonzero 640x448 dimensions.
+- Kept RenderWare's active video mode aligned with the successful device
+  reset and current client area while retaining original menu choices.
+- Ignored startup-only resolution selection hooks before the first Direct3D
+  device so saved INI geometry is not overridden by legacy game settings.
+- Added ResolutionX = 0 and ResolutionY = 0 (together) to use the monitor
+  resolution, including on systems where the desktop is 3840x2160.
+- New installations/default INI now select WindowMode = 3, borderless
+  fullscreen, and desktop resolution. Existing custom INIs are untouched.
+- Added portable resolution-policy unit tests and documentation.
+- In WindowMode = 1, a 3840x2160 bordered window cannot fit a 3840x2160
+  monitor without shrinking the client area to make room for the frame.
+- Windows runtime/device-reset compatibility and actual 4K render output
+  require in-game testing; no Windows executable or compiled ASI provided.
+
+Optimization and automatic build update (2026-10-20)
+-----------------------------------------------------------------
+
+PERFORMANCE
+- Reduced redundant ShowCursor and ClipCursor calls during rendering;
+  synchronize on state changes and periodically for compatibility.
+- Cached screen-space client bounds to avoid repeated geometry queries
+  while the window is unchanged.
+- Reduced work in high-frequency mouse messages by using provided
+  client-space coordinates where appropriate.
+- Avoided repeated INI reads and writes when persisted settings are
+  unchanged.
+- Avoided redundant SetWindowTextA calls when the caption is unchanged.
+- Improved the FPS display calculation using elapsed time measured with
+  a monotonic clock instead of whole-second time buckets.
+
+BUG FIXES AND ROBUSTNESS
+- Prevented auto-resume from closing menus that the player opened
+  manually when auto-pause had not been triggered by the plugin.
+- Avoided re-clipping the pointer while the window is being moved
+  or resized.
+- Initialized the window-title character buffer and made title
+  formatting truncation-safe.
+
+BUILD AUTOMATION
+- Added build.bat as a one-command Windows build launcher.
+- Added tools/build.ps1 to restore missing build dependencies,
+  including nested dependencies such as SafetyHook.
+- Added support for restoring pinned Git submodules in Git checkouts,
+  or downloading upstream sources when building an extracted ZIP.
+- Added Visual Studio C++ Build Tools detection/installation handling,
+  Premake solution generation and Release/Win32 ASI compilation.
+- Added optional release packaging with:
+      build.bat Release -Package
+- Updated readme.md with build instructions and verification notes.
+- Added an optimization report and an FPS counter regression test.
+
+COMPATIBILITY AND TEST STATUS
+- This earlier optimization pass did not alter frame caps, VSync,
+  or physics timing. Native resolution behavior was updated separately
+  in the subsequent 4K regression fix noted above.
+- FPS counter unit tests passed in a Linux environment.
+- Full Windows compilation, automatic dependency installation,
+  actual in-game behavior and FPS/frametime gains have NOT been
+  verified. Test on supported game versions before release.
+- This update is source code; the ZIP does not contain a verified
+  compiled ASI.
+- These changes are not an upstream version-numbered release.
+
+PREVIOUS RELEASE HISTORY
+========================
+
+Version 2.2
+
+- refactored game bindings into pattern-based modules, adding GTA III and Vice City v1.1 and Steam executable support
+- preserved the game's registered window class and chained its window procedure
+- added a documented INI with backward-compatible settings migration
+
+- improved window resizing and Direct3D device reset handling in GTA3, GTA-VC and GTA SA
+- fixed resolution changes from the game's display settings
+- Alt+Enter now toggles between desktop-sized borderless fullscreen and the previous windowed style
+- added Ctrl+Enter to switch between bordered and borderless window styles
+- added a 640x480 fallback when the saved windowed resolution matches the desktop resolution
+- improved window sizing with DPI scaling and centering on secondary monitors
+- deferred post-effect updates until rendering resumes after a device reset
+- removed the menu frame limiter from this plugin; it is now provided by Widescreen Fix through the MenuFrameLimit setting
+
+Version 2.0
+- added error message about unsupported game version
+- added error message about missing ASI Loader
+- added auto pause and auto resume features
+- removed CoordsManager menu
+- simplified settings: Alt+Enter now cycles between all available window styles
+- window size and style are now stored in the config file and restored on game start
+- proper support of multiple monitors
+- always show cursor over the inactive game window
+- fixed cursor moving out of the window during gameplay in GTA3 and GTA-VC
+- fixed flickering window title text
+- added aspect ratio information to window title text
+- added snapping to known aspec ratios when resizing the window
+- fixed missing window icon in GTA3
+- fixed issues with audio and animations in the main menu by implementing a frame limiter for it
+- fixed freezes when Grinch's ImGUI plugin is used
+
+Version 1.17
+- fixed incorrect positioning of the window in full mode introduced in 1.16
+- always show cursor over inactive game window
+
+Version 1.16
+- setting of initial window position is now done on game start, not postponed until entering main menu
+- last window position is now stored in config file and restored on game start
+
+Version 1.15
+- fixed mouse cursor not showing up in GTA SA

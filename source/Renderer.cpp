@@ -1,6 +1,7 @@
 module;
 #include "stdafx.h"
 #include "Bindings.h"
+#include "ResolutionPolicy.h"
 
 module WindowedMode;
 
@@ -24,6 +25,7 @@ void WindowedMode::InstallRenderHooks()
             {
                 inst->d3dDevice = *inst->bindings.device;
                 inst->postEffectUpdatePending = false;
+                inst->firstFrameDiagnosticsPending = true;
             }
         });
     for (auto address : bindings.beforeReset)
@@ -76,21 +78,9 @@ void WindowedMode::InitPresentationParameters()
         d3dPresentParams8->FullScreen_RefreshRateInHz = 0;
     }
 
-    // Only adapt the startup mode. Keep the menu's original resolutions intact.
-    BackupVideoModes();
-    const auto current = RwEngineGetCurrentVideoMode();
-    if (*rwVideoModes && current < videoModesBackup.size())
-    {
-        if (modifiedVideoMode >= 0 && modifiedVideoMode < (int)videoModesBackup.size())
-            (*rwVideoModes)[modifiedVideoMode] = videoModesBackup[modifiedVideoMode];
-        modifiedVideoMode = (int)current;
-        auto& mode = (*rwVideoModes)[current];
-        mode.width = windowSizeClient.x;
-        mode.height = windowSizeClient.y;
-        mode.format = IsD3D9() ? d3dPresentParams9->BackBufferFormat : d3dPresentParams8->BackBufferFormat;
-        mode.refreshRate = IsD3D9() ? d3dPresentParams9->FullScreen_RefreshRateInHz : d3dPresentParams8->FullScreen_RefreshRateInHz;
-        mode.flags &= ~1; // clear fullscreen flag
-    }
+    // Only the active mode is rewritten. BackupVideoModes retains the original
+    // menu list, while the active RenderWare mode reflects the real backbuffer.
+    SyncActiveVideoMode();
 }
 
 bool WindowedMode::IsD3D9() const
@@ -106,6 +96,11 @@ void WindowedMode::BeforePresent()
         postEffectUpdatePending = false;
         UpdatePostEffect();
     }
+    if (firstFrameDiagnosticsPending)
+    {
+        firstFrameDiagnosticsPending = false;
+        WriteResolutionDiagnostics("first rendered frame / reset");
+    }
     MouseUpdate();
     if (fpsCounter.update()) WindowUpdateTitle();
 }
@@ -119,9 +114,21 @@ void WindowedMode::BeforeReset()
     auto prepare = [this](auto& parameters)
     {
         RECT client{};
-        GetClientRect(window, &client);
-        if (!parameters.BackBufferWidth) parameters.BackBufferWidth = client.right;
-        if (!parameters.BackBufferHeight) parameters.BackBufferHeight = client.bottom;
+        if (window) GetClientRect(window, &client);
+        // RenderWare can send old nonzero 640x448 buffers. Use the actual
+        // physical client whenever available. During minimization only,
+        // retain the last known-good size (never force a 0x0 device reset).
+        // Windows headers may define min(a,b) as a macro. The parenthesized
+        // function name avoids that expansion, and matching argument types
+        // avoid deduction failures on Windows (UINT versus unsigned long).
+        constexpr auto maxBackBufferDimension = decltype(parameters.BackBufferWidth){16384u};
+        const auto size = ResolutionPolicy::ResetExtent(
+            {client.right, client.bottom}, {windowSizeClient.x, windowSizeClient.y},
+            {static_cast<int32_t>((std::min)(parameters.BackBufferWidth, maxBackBufferDimension)),
+             static_cast<int32_t>((std::min)(parameters.BackBufferHeight, maxBackBufferDimension))},
+            {Resolution_Default.x, Resolution_Default.y});
+        parameters.BackBufferWidth = size.width;
+        parameters.BackBufferHeight = size.height;
         parameters.Windowed = TRUE;
         parameters.hDeviceWindow = window;
         parameters.SwapEffect = D3DSWAPEFFECT_DISCARD;
@@ -142,6 +149,13 @@ void WindowedMode::AfterReset(HRESULT result)
     memcpy(d3dPresentParams8, SUCCEEDED(result) ? resetEffective.data() : resetSaved.data(), size);
     resetInProgress = false;
     postEffectUpdatePending = SUCCEEDED(result);
+    if (SUCCEEDED(result)) firstFrameDiagnosticsPending = true;
+    if (SUCCEEDED(result))
+    {
+        // The game can retain its previous 640x448 mode after a successful
+        // Direct3D reset. Keep its active metadata in sync with the buffer.
+        SyncActiveVideoMode();
+    }
 }
 
 void WindowedMode::UpdatePostEffect()

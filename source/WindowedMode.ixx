@@ -43,6 +43,12 @@ public:
     void InitConfig(); // create default ini file
     bool LoadConfig(); // returns true if maximized
     void SaveConfig();
+    void EnableDpiAwareness(); // before any game window is created
+    void WriteResolutionDiagnostics(const char* event);
+    bool highDpiAware = true;
+    bool resolutionDiagnostics = false;
+    bool firstFrameDiagnosticsPending = false;
+    const char* dpiSetupResult = "not attempted";
 
     // game window
     struct AspectRatioInfo { const char* name; float ratio; };
@@ -64,9 +70,23 @@ public:
     WindowMode windowMode = WindowMode::Windowed;
     WindowMode windowedStyle = WindowMode::Windowed;
     bool enterShortcutDown = false;
+
+    // Keep expensive cursor synchronization off the render hot path.
+    RECT cursorClientRect{};
+    RECT cursorClipRect{};
+    bool cursorClientRectValid = false;
+    bool cursorSyncValid = false;
+    bool cursorShown = true;
+    bool cursorClipped = false;
+    DWORD lastCursorSyncTime = 0;
+
+    // Skip disk writes when window-state notifications repeat identical values.
+    std::array<int, 9> savedConfigState{};
+    bool savedConfigStateValid = false;
+    bool autoDesktopResolution = false; // ResolutionX/Y = 0/0, preserved on save
     
     
-    char windowTitle[64];
+    char windowTitle[64]{};
     // current window geometry
     POINT windowPos = {};
     POINT windowSize = {};
@@ -74,11 +94,14 @@ public:
     // last properties of windowed mode
     POINT windowPosWindowed = { -1, -1 };
     POINT windowSizeWindowed = Resolution_Default;
+    POINT sizeBeforeUserResize = {};
 
     void WindowCalculateGeometry(bool center = false, bool resizeWindow = false);
+    void WindowApplyExternalRect(const RECT& bounds); // DPI/display changes, one renderer resize
     void WindowResize(POINT resolution);
     void ChangeResolution(DWORD modeIndex);
     void BackupVideoModes();
+    void SyncActiveVideoMode();
     void InitPresentationParameters();
     static void __cdecl ChangeResolutionSA(DWORD modeIndex);
     static int __cdecl ChangeVideoModeSA(DWORD modeIndex);

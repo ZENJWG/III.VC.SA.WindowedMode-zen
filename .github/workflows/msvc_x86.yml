@@ -51,6 +51,9 @@ jobs:
       with:
         submodules: recursive
 
+    - name: Validate offline frame-time reporting
+      run: python -m unittest discover -s tests -p test_frame_time_report.py -v
+
     - name: Add msbuild to PATH
       uses: microsoft/setup-msbuild@main
 
